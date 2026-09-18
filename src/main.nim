@@ -1,1 +1,312 @@
+import std/[os, strutils, parseopt]
+import options as zccopts
+import lexer/[lexer, tokens]
+import diagnostics
+import target
+import hardening
+import depgen
+import cache
+import parallel
+import preprocessor/preprocessor as pp
+import sanitize
+import linker
+import lto
+import reproducible
+import projectconfig
+import plugins
 
+const Version = "0.0.1-dev"
+
+proc printHelp() =
+  echo """
+zcc """ & Version & """ - Zenit C Compiler (C99-C23), napisany w Nim
+
+Użycie: zcc [opcje] plik.c [plik2.c ...]
+
+Podstawowe:
+  -o <plik>         Plik wyjściowy
+  -c                Tylko kompiluj do .o, nie linkuj
+  -S                Zatrzymaj się na asemblerze
+  -E                Tylko preprocesor (wypisz rozwinięty kod na stdout)
+  -std=c99|c11|c17|c23   Standard C (domyślnie c17)
+  -O0|-O1|-O2|-O3|-Os     Poziom optymalizacji (domyślnie -O0)
+  -g                Informacje debugowe
+  -I <dir>          Katalog nagłówków
+  -D <name>=<val>   Definicja makra
+  -L <dir>          Katalog bibliotek
+  -l <name>         Linkowana biblioteka
+  -Werror           Traktuj ostrzeżenia jak błędy
+  -v, --verbose     Tryb gadatliwy
+  --no-color        Wyłącz kolory w diagnostyce
+
+Linkowanie:
+  -static           Wymuś statyczne linkowanie (domyślne i tak)
+  -dynamic          Linkuj dynamicznie (alias: --dyn-link)
+
+Hardening (bezpieczeństwo domyślnie włączone, agresywniej niż gcc):
+  --hardened=off|default|max   (domyślnie: default)
+  --no-hardened                 alias dla --hardened=off
+
+Sanitizery (dev/CI - narzut wydajnościowy, nie do produkcji):
+  -fsanitize=address,undefined,thread,memory   (rozdzielone przecinkami)
+
+LTO:
+  --lto=off|thin|full   (domyślnie: off; zalecane: thin przy -O2/-O3)
+
+Reprodukowalne buildy:
+  --reproducible     Normalizacja ścieżek/timestampów (reproducible-builds.org)
+
+Cross-compilation:
+  --target=<triple>  np. aarch64-linux-musl, x86_64-linux-gnu
+                      (domyślnie: host, ABI musl)
+
+Tooling / wydajność builda:
+  -MM               Wypisz reguły zależności (make) na stdout, nie kompiluj
+  -MMD              Generuj plik .d obok wyjścia i kompiluj normalnie
+  -j <N>, --jobs=<N>   Liczba równoległych jednostek translacji
+  --no-cache         Wyłącz cache obiektów (domyślnie włączony)
+  --cache-dir=<dir>  Katalog cache (domyślnie ~/.cache/zcc)
+  --cache-stats      Pokaż statystyki cache i zakończ
+  --cache-clear      Wyczyść cache i zakończ
+  --no-pch           Wyłącz prekompilowane nagłówki
+
+Pluginy:
+  --plugin=<ścieżka.so>   Załaduj plugin lintujący (ABI: patrz src/plugins.nim)
+
+Konfiguracja projektu:
+  Automatycznie wczytywana z zcc.toml (najbliższego w górę drzewa
+  katalogów) jako domyślne wartości - flagi CLI mają pierwszeństwo.
+
+Debug:
+  --dump-tokens      [debug] wypisz strumień tokenów (po preprocesorze) i zakończ
+  --no-preprocess    [debug] z --dump-tokens: pomiń preprocesor, lexuj surowy plik
+  --version          Wersja
+  --help             Ta pomoc
+"""
+
+proc parseArgs(): zccopts.Config =
+  # Baza: zcc.toml (jeśli istnieje) nadpisywane przez flagi CLI poniżej.
+  result = projectconfig.loadProjectConfig(getCurrentDir())
+  var dumpTokens = false
+  var noPreprocess = false
+  var cacheStats = false
+  var cacheClear = false
+  var p = initOptParser(commandLineParams())
+  for kind, key, val in p.getopt():
+    case kind
+    of cmdArgument:
+      result.inputs.add key
+    of cmdLongOption, cmdShortOption:
+      case key
+      of "o": result.output = val
+      of "c": result.outKind = okObjectOnly
+      of "S": result.outKind = okAssemblyOnly
+      of "E": result.outKind = okPreprocessOnly
+      of "shared": result.outKind = okSharedLib
+      of "static": result.link = lmStatic
+      of "dynamic", "dyn-link": result.link = lmDynamic
+      of "g": result.debugInfo = true
+      of "v", "verbose": result.verbose = true
+      of "Werror": result.warningsAsErrors = true
+      of "no-color": result.noColor = true
+      of "dump-tokens": dumpTokens = true
+      of "no-preprocess": noPreprocess = true
+      of "MM": result.depMode = depMM
+      of "MMD": result.depMode = depMMD
+      of "j", "jobs":
+        try: result.jobs = parseInt(val)
+        except ValueError:
+          stderr.writeLine "zcc: nieprawidłowa wartość -j: " & val
+          quit(1)
+      of "no-cache": result.cacheEnabled = false
+      of "cache-dir": result.cacheDir = val
+      of "cache-stats": cacheStats = true
+      of "cache-clear": cacheClear = true
+      of "no-pch": result.usePch = false
+      of "target": result.targetTriple = val
+      of "no-hardened": result.hardening = hardOff
+      of "hardened":
+        case val
+        of "off": result.hardening = hardOff
+        of "default", "": result.hardening = hardDefault
+        of "max": result.hardening = hardMax
+        else:
+          stderr.writeLine "zcc: nieznany poziom hardeningu: " & val
+          quit(1)
+      of "lto": result.ltoMode = (if val.len > 0: val else: "thin")
+      of "reproducible": result.reproducible = true
+      of "plugin": result.pluginPaths.add val
+      of "version":
+        echo "zcc ", Version
+        quit(0)
+      of "help":
+        printHelp()
+        quit(0)
+      elif key.startsWith("std"):
+        case val
+        of "c99": result.std = stdC99
+        of "c11": result.std = stdC11
+        of "c17", "c18": result.std = stdC17
+        of "c23": result.std = stdC23
+        else:
+          stderr.writeLine "zcc: nieznany standard: " & val
+          quit(1)
+      elif key.startsWith("fsanitize"):
+        result.sanitizers = val.split(',')
+      elif key == "I":
+        result.includeDirs.add val
+      elif key == "L":
+        result.libDirs.add val
+      elif key == "l":
+        result.libs.add val
+      elif key == "D":
+        let parts = val.split('=', 1)
+        if parts.len == 2:
+          result.defines.add (parts[0], parts[1])
+        else:
+          result.defines.add (val, "1")
+      else:
+        if key.startsWith("O") and key.len >= 2:
+          case key[1..^1]
+          of "0": result.opt = opt0
+          of "1": result.opt = opt1
+          of "2": result.opt = opt2
+          of "3": result.opt = opt3
+          of "s": result.opt = optS
+          else: discard
+        else:
+          stderr.writeLine "zcc: nieznana opcja: -" & key
+    of cmdEnd: discard
+
+  if cacheStats:
+    let s = cache.stats(result)
+    echo "zcc cache: ", s.entries, " obiektów, ", s.bytes, " B w ", cache.cacheDirFor(result)
+    quit(0)
+  if cacheClear:
+    cache.clear(result)
+    echo "zcc cache: wyczyszczony (", cache.cacheDirFor(result), ")"
+    quit(0)
+
+  if result.outKind == okPreprocessOnly:
+    for f in result.inputs:
+      try:
+        stdout.write pp.preprocessFile(f, result.std, result.includeDirs)
+      except pp.PreprocessError as e:
+        stderr.writeLine "zcc: " & e.msg
+        quit(1)
+    quit(0)
+
+  if dumpTokens:
+    for f in result.inputs:
+      var src: string
+      if noPreprocess:
+        src = readFile(f)
+      else:
+        try:
+          src = pp.preprocessFile(f, result.std, result.includeDirs)
+        except pp.PreprocessError as e:
+          stderr.writeLine "zcc: " & e.msg
+          quit(1)
+      var lx = newLexer(src, f, result.std)
+      var allToks: seq[Token] = @[]
+      for tok in lx.tokens():
+        allToks.add tok
+        echo f, ":", tok.line, ":", tok.col, "\t", tok.kind, "\t", tok.text
+      for d in lx.diags:
+        reportWithSource(d, src, not result.noColor)
+
+      if result.pluginPaths.len > 0:
+        let loaded = loadAllPlugins(result.pluginPaths)
+        for pl in loaded:
+          if not pl.ok: continue
+          let diags = runPluginOnTokens(pl, allToks)
+          for d in diags:
+            let sev = if d.isError: "error" else: "warning"
+            stderr.writeLine f & ":" & $d.line & ":" & $d.col & ": " & sev &
+              " [" & pl.path.extractFilename & "]: " & d.message &
+              (if d.suggestion.len > 0: "\n  suggestion: " & d.suggestion else: "")
+    quit(0)
+
+when isMainModule:
+  let cfg = parseArgs()
+  if cfg.inputs.len == 0:
+    stderr.writeLine "zcc: brak plików wejściowych"
+    quit(1)
+
+  let tgt = resolveTarget(cfg.targetTriple)
+  if cfg.verbose:
+    stderr.writeLine "zcc: std=" & $cfg.std & " link=" & $cfg.link &
+      " opt=" & $cfg.opt & " target=" & tgt.llvmTriple &
+      " hardening=" & $cfg.hardening & " lto=" & cfg.ltoMode &
+      " reproducible=" & $cfg.reproducible & " jobs=" & $jobCount(cfg) &
+      " inputs=" & $cfg.inputs
+
+  # --- hardening ---
+  let hard = resolveHardeningFlags(cfg, tgt)
+  for w in hard.warnings:
+    stderr.writeLine "zcc: warning: " & w
+  if cfg.verbose and hard.flags.len > 0:
+    stderr.writeLine "zcc: hardening flags: " & hard.flags.join(" ")
+
+  # --- sanitizery ---
+  if cfg.sanitizers.len > 0:
+    var sans: seq[SanitizerKind] = @[]
+    for s in cfg.sanitizers:
+      try: sans.add parseSanitizer(s)
+      except ValueError as e:
+        stderr.writeLine "zcc: " & e.msg
+        quit(1)
+    let sanRes = resolveSanitizeFlags(sans, cfg, tgt)
+    for e in sanRes.errors:
+      stderr.writeLine "zcc: error: " & e
+    if sanRes.errors.len > 0: quit(1)
+    for w in sanRes.warnings:
+      stderr.writeLine "zcc: warning: " & w
+    if cfg.verbose:
+      stderr.writeLine "zcc: sanitize flags: " & sanRes.flags.join(" ")
+
+  # --- LTO ---
+  let ltoRes = resolveLtoFlags(parseLtoMode(cfg.ltoMode), jobCount(cfg))
+  if cfg.verbose and ltoRes.note.len > 0:
+    stderr.writeLine "zcc: lto: " & ltoRes.note
+
+  # --- reproducible builds ---
+  if cfg.reproducible:
+    let root = if cfg.inputs.len > 0: cfg.inputs[0].parentDir.absolutePath else: getCurrentDir()
+    let reproRes = resolveReproducibleFlags(cfg, root)
+    if cfg.verbose:
+      stderr.writeLine "zcc: reproducible flags: " & reproRes.compileFlags.join(" ")
+
+  # --- pluginy ---
+  var loadedPlugins: seq[plugins.LoadedPlugin] = @[]
+  if cfg.pluginPaths.len > 0:
+    loadedPlugins = loadAllPlugins(cfg.pluginPaths)
+
+  # --- -MM / -MMD ---
+  if cfg.depMode == depMM:
+    for f in cfg.inputs:
+      stdout.write makeRuleFor(f, cfg)
+    quit(0)
+  if cfg.depMode == depMMD:
+    for f in cfg.inputs:
+      writeDepFile(f, cfg)
+      if cfg.verbose:
+        stderr.writeLine "zcc: zapisano .d dla " & f
+
+  # --- cache (plan - realne spięcie czeka na codegen, patrz ROADMAP) ---
+  if cfg.cacheEnabled and cfg.outKind == okObjectOnly:
+    for f in cfg.inputs:
+      let key = cache.computeKey(f, cfg)
+      let entry = cache.lookup(cfg, key)
+      if cfg.verbose:
+        stderr.writeLine "zcc: cache " & (if entry.hit: "HIT " else: "MISS ") &
+          f & " -> " & entry.objPath
+
+  if cfg.outKind == okObjectOnly and cfg.inputs.len > 1 and cfg.verbose:
+    stderr.writeLine "zcc: równoległy plan builda: " & $jobCount(cfg) &
+      " jobów dla " & $cfg.inputs.len & " plików (self.exe=" & getAppFilename() & ")"
+
+  stderr.writeLine "zcc: front-end (parser/sema/codegen) jeszcze niegotowy " &
+    "- patrz docs/ROADMAP.md. Preprocesor już działa: spróbuj -E albo " &
+    "--dump-tokens."
+  quit(1)
