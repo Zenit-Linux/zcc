@@ -1,0 +1,7 @@
+*.build linguist-detectable=true
+*.build linguist-documentation=false
+*.build linguist-language=HCL
+
+*.examplee linguist-detectable=true
+*.example linguist-documentation=false
+*.example linguist-language=HCL
