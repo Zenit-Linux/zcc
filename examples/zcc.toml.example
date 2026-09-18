@@ -1,0 +1,22 @@
+# Przykładowy zcc.toml - skopiuj do katalogu projektu jako `zcc.toml`.
+# Parsowany przez src/projectconfig.nim - podzbiór TOML (patrz komentarz
+# w tamtym pliku o ograniczeniach: brak zagnieżdżonych tabel/multiline).
+# Flagi z linii poleceń zawsze nadpisują wartości stąd.
+
+[build]
+std = "c23"
+target = "aarch64-linux-musl"
+link = "static"          # "static" (domyślne i tak) lub "dynamic"
+include_dirs = ["include", "vendor/include"]
+libs = ["m"]
+lto = "thin"              # "off" | "thin" | "full"
+reproducible = true
+
+[hardening]
+level = "max"              # "off" | "default" | "max"
+
+[dev]
+sanitizers = ["address", "undefined"]
+
+[plugins]
+paths = ["./tools/no_tabs_lint.so"]
