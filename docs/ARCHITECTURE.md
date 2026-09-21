@@ -218,9 +218,10 @@ z lexera - wystarczające dla reguł stylu (zakaz tabów, długość linii,
 zakazane identyfikatory), nie dla analiz semantycznych. ABI: `.so` z
 funkcjami C (`{.cdecl.}`), ten sam model co pluginy gcc/clang - niezależny
 od tego, w jakim języku plugin jest napisany. Przykład działającego
-pluginu w C: `examples/plugins/no_tabs_lint.c`. Gdy powstanie AST (etap 2),
-dojdzie analogiczny `zcc_plugin_check_ast` obok istniejącego
-`zcc_plugin_check_tokens`.
+pluginu w C: `examples/plugins/no_tabs_lint.c`. AST istnieje już od
+etapu 2 (`src/parser/ast.nim`), ale hak `zcc_plugin_check_ast` na nim
+jeszcze nie powstał - dziś pluginy widzą wyłącznie strumień tokenów
+przez `zcc_plugin_check_tokens` (patrz `runPluginOnTokens` w `plugins.nim`).
 
 ## 18. Obsługa standardów C99–C23
 
@@ -231,3 +232,214 @@ Lexer/parser mają tryb sterowany przez `-std=`:
 - jeden AST dla wszystkich wersji, różnice to głównie: dostępność
   konstrukcji w parserze + różne domyślne makra predefiniowane
   (`__STDC_VERSION__` itd.) w preprocesorze.
+
+**Stan dziś (uczciwie)**: `-std=` steruje lexerem/preprocesorem
+(makra predefiniowane, `//` komentarze itd. — patrz `tokens.nim`), ale
+parser (`src/parser/parser.nim`) **jeszcze nie odrzuca** konstrukcji
+spoza wybranego standardu - akceptuje liberalnie nadzbiór (np. `nullptr`
+czy `bool` jako słowo kluczowe działają nawet z `-std=c99`). Twarde
+bramkowanie cech językowych wg `CStd` to TODO na etap 5, gdy będzie
+komplet testów zgodności per-standard do zweryfikowania, że bramkowanie
+niczego nie psuje.
+
+## 19. Parser, AST i sema (`src/parser/`, `src/sema/`)
+
+Etap 2 z ROADMAP.md. Trzy moduły, jeden kierunek przepływu danych:
+tokeny z lexera → `parser.parseTokens` → `ast.Node` (`TranslationUnit`)
+→ `sema.runSema` → diagnostyki. `printer.dumpAst` to ślepy odczyt AST,
+nie wpływa na resztę pipeline'u - czysto debugowe narzędzie za `--dump-ast`.
+
+**AST (`ast.nim`)**: świadomie "płaski" `Node` - jeden `ref object` z
+polami ogólnego przeznaczenia (`a`,`b`,`c`,`d`,`list`,`op`,`strVal`,`typ`)
+zamiast osobnego typu wariantowego per `NodeKind`. Znaczenie pól opisane
+w komentarzu przy każdej wartości `NodeKind`. Kompromis świadomy: mniej
+boilerplate'u teraz, koszt płaci się czytelnością (trzeba znać konwencję)
+- do rewizji, jeśli AST urośnie w etapie 5+ o pełne C99-C23.
+
+**Parser (`parser.nim`)**: ręczny recursive-descent, zero zależności/
+generatorów parserów. Dwa miejsca, gdzie C jest naprawdę nieprzyjemny do
+parsowania, i jak je tu rozwiązano:
+1. **Deklaratory "na spirali"** (`int (*p)[10]`, wskaźniki do funkcji,
+   funkcje zwracające wskaźniki do funkcji...) - budowane jako łańcuch
+   domknięć `proc(base: CType): CType {.closure.}`, składanych w
+   kolejności zgodnej z gramatyką deklaratora (`parseDeclaratorChain`/
+   `parseDirectDeclaratorChain`). To jest najbardziej "gęsty" fragment
+   parsera - warto przeczytać komentarz na górze pliku przed edycją.
+2. **Problem typedef** (`Foo * x;` - deklaracja czy mnożenie?) -
+   parser trzyma stos zbiorów znanych nazw typedef (`typedefScopes`),
+   aktualizowany na bieżąco w trakcie parsowania, zgodnie z tym, jak
+   wymaga tego standard C (nierozwiązywalne wyłącznie w sema, po fakcie).
+
+Odzyskiwanie po błędach: **bez wyjątków** w normalnym przepływie - błąd
+składni zgłasza `Diagnostic` (ten sam `errAt`/`warnAt` co lexer) i
+synchronizuje się do najbliższego `;`/`}`, żeby zgłosić więcej niż jeden
+błąd na przebieg. To jest wprost ta "przewaga w diagnostyce nad gcc" z
+README, tylko przeniesiona z lexera do parsera.
+
+**Sema (`sema.nim`)**: scoping przez stos `Table[string, Sym]`, jeden
+przebieg nad AST. Zakres dziś: redefinicje, nieznane identyfikatory
+(z sugestią "czy chodziło o..." oparte o odległość Levenshteina - patrz
+`suggestSimilar`), stałe enuma jako osobne symbole (`declareTag`),
+break/continue/case poza kontekstem, kontrola liczby argumentów wywołania
+względem znanego prototypu, ostrzeżenia o niezgodnym `return`. Celowo
+**nie robi** pełnej kontroli typów wyrażeń (konwersje niejawne, promocje
+arytmetyczne C) - to wymaga kompletnego modelu rozmiarów/ABI z `target.nim`,
+którego jeszcze nie ma w tej formie; zgadywanie reguł bez tego dawałoby
+fałszywe poczucie bezpieczeństwa gorsze niż brak kontroli.
+
+**CLI**: `-fsyntax-only` (parsuj+sprawdź, nie generuj kodu) i `--dump-ast`
+(jak wyżej + wypisz drzewo). `--no-sema` pozwala pominąć sema przy
+debugowaniu samego parsera. Diagnostyki z parsera i sema są łączone i
+deduplikowane (`dedupDiags` w `main.nim`) przed wypisaniem - obie warstwy
+celowo powtarzają część kontroli (np. break/continue poza pętlą) dla
+odporności, gdy AST trafi kiedyś do sema spoza tego pipeline'u (np.
+plugin API, patrz §17), więc trzeba je scalić, żeby użytkownik nie
+widział tego samego błędu dwa razy.
+
+## 20. Codegen: x86-64, `as`/`ld` (`src/codegen/`, `src/linker.nim`, `src/target.nim`)
+
+Etap 3 z ROADMAP.md - **milestone "hello world" osiągnięty**: `./zcc
+program.c -o program && ./program` daje działający plik ELF, zweryfikowane
+end-to-end (włącznie z prawdziwym `printf`) w `tests/run_tests.nim`.
+
+**Decyzja architektoniczna**: bezpośrednia emisja asemblera x86-64 (AT&T),
+złożenie przez `as` i linkowanie przez `ld` (oba z binutils) - **nie**
+bindingi LLVM, **nie** nakładka na gcc/clang jako "driver". Powód: LLVM
+jako zależność (libLLVM + nagłówki C++) jest ciężki i niedostępny w wielu
+środowiskach (w tym tym, w którym pisany był ten kod), a cel etapu to
+"MVP" - działający kompilator, nie najszybszy wygenerowany kod. Granica
+`generateModule(unit) -> tekst asemblera` w `codegen.nim` jest na tyle
+czysta, że LLVM (albo jakikolwiek inny backend) mógłby zostać dodany
+później jako ALTERNATYWA, nie przepisanie.
+
+**Model generacji (`codegen.nim`)** - uproszczony, ale rozmyślnie:
+- **Brak alokacji rejestrów.** Każde wyrażenie liczone jest w %rax;
+  wyrażenia binarne odkładają lewy operand przez prawdziwe `pushq`/`popq`
+  CPU (klasyczna "stack machine"). Wolniejsze niż zoptymalizowany kod
+  gcc, ale eliminuje całą klasę błędów alokatora rejestrów - właściwy
+  kompromis dla MVP.
+- **Zmienne lokalne = stałe sloty.** Każda zmienna lokalna (w tym
+  zagnieżdżona w blokach) dostaje własny, na stałe przydzielony offset
+  `-N(%rbp)` w ramce funkcji - bez odzyskiwania miejsca między sąsiednimi
+  blokami. Marnuje trochę stosu, upraszcza dramatycznie codegen.
+- **Wyrównanie stosu do 16 bajtów przy `call`** (wymóg SysV ABI - inaczej
+  instrukcje SSE używane WEWNĄTRZ funkcji bibliotecznych jak `printf`
+  segfaultują) pilnowane przez `ctx.pushDepth` - licznik odłożonych
+  8-bajtowych wartości śledzony W CZASIE GENEROWANIA kodu (nie w
+  runtime); jego parzystość mówi, czy %rsp jest aktualnie 16-wyrównany.
+  Padding wstawiany selektywnie tuż przed `call`, gdy parzystość tego
+  wymaga - patrz komentarz przy `genArgsCommon`.
+- **Agregaty (struct/union/tablica) jako "wartość" = ich ADRES w %rax.**
+  Nigdy nie są kopiowane do rejestru w całości. `genLoad` ładuje spod
+  adresu (dereferencja) TYLKO dla typów skalarnych (`isScalarType` z
+  `layout.nim`) - dla agregatów zostawia adres, co naturalnie realizuje
+  rozpad tablicy do wskaźnika (array decay) bez żadnego specjalnego kodu.
+- **`sizeof(wyrażenie)` bez efektów ubocznych** (C tego wymaga poza VLA,
+  nieobsługiwanymi tutaj) realizowane sztuczką: `typeOfExprNoEmit`
+  przekierowuje bufor wyjściowy na czas wywołania `genExpr`, odczytuje
+  zwrócony typ, i odrzuca wygenerowany tekst - bezpieczne, bo żadna
+  "prawdziwa" ewaluacja się nie dzieje w fazie codegenu (to tylko tekst),
+  jedyne ryzyko (niebalansowanie `pushDepth`) nie występuje, bo `genExpr`
+  zawsze sam bilansuje własne push/pop.
+
+**Dwa przebiegi scalające AST przed właściwym codegenem** (obie w
+`resolveAllTypedefs`/`foldEnumConstants`, wywoływane na początku
+`generateModule`) - bez nich całe klasy poprawnego kodu C by nie działały:
+1. **Scalanie typedefów I tagów struct/union/enum.** Parser tworzy NOWĄ,
+   niezależną instancję `CType` przy KAŻDYM wystąpieniu `struct Foo`/
+   `typedef`-nazwy w źródle (patrz `parser.nim`) - `struct Point p;` po
+   wcześniejszym `struct Point { int x, y; };` gdzie indziej dostawałoby
+   pusty, niekompletny typ bez pól, gdyby nic tego nie scaliło. Pole
+   `CType.resolved` (jedno na oba przypadki: alias typedefu i niekompletny
+   tag) jest wypełniane jednym przebiegiem po całym drzewie AST, a
+   `layout.resolveTypedef` podąża za tym łańcuchem przy każdym
+   `typeSizeOf`/`fieldOffset`/itd. Uproszczenie: jeden płaski, globalny
+   zakres nazw (nie w pełni poszanowany zasięg bloków) - udokumentowane
+   ograniczenie, jak przy podobnych uproszczeniach w sema.
+2. **Foldowanie stałych enuma do literałów.** Zamiast przeciągać osobną
+   tabelę symboli przez cały `layout.nim` (który m.in. liczy rozmiary
+   tablic i etykiety `case` - obie rzeczy potrzebują znać wartości stałych
+   enuma), `foldEnumConstants` podmienia w AST każdy `nkIdent` o nazwie
+   znanej stałej enuma na `nkIntLit` z jej wartością, mutując węzeł w
+   miejscu. Po tym przebiegu `case GREEN:` i `int arr[GREEN + 1]` działają
+   bez żadnej specjalnej obsługi w reszcie codegenu - `evalConstInt`
+   widzi już zwykłe liczby.
+
+**`layout.nim`**: sizeof/alignof/offsety pól dla modelu LP64 (Linux
+x86-64: char=1, short=2, int=4, long/long long/wskaźnik=8) + ewaluator
+stałych wyrażeń całkowitych (`evalConstInt` - rozmiary tablic, wartości
+enumeratorów, etykiety `case`, `_Static_assert`). Oba w jednym module
+celowo: `sizeof(T)` użyte w stałej potrzebuje `typeSizeOf`, a
+`typeSizeOf` dla tablic potrzebuje ewaluatora do policzenia rozmiaru z
+wyrażenia - rozdzielenie ich na osobne moduły dałoby cykl importów.
+
+**Linker driver (`linker.nim` + `target.nim`)**: `assembleFile`/
+`linkExecutable` wołają `as`/`ld` bezpośrednio (nie przez gcc). Lokalizacja
+crt1.o/crti.o/crtn.o i libc (`findCLibPaths`) próbuje najpierw ABI
+docelowej (musl - patrz `hostTarget()`), a jeśli jej nie ma na hoście,
+spada na glibc (i odwrotnie) - dzięki temu kompilacja działa "od ręki" na
+zwykłym Ubuntu/Debianie (gdzie zwykle jest tylko glibc), mimo że docelowa
+dystrybucja projektu (Zenit Linux) ma być na musl. Szczegół odkryty
+empirycznie: **statyczne** linkowanie z glibc wymaga dołączenia
+`libgcc.a` ORAZ `libgcc_eh.a` (glibc.a odwołuje się do `_Unwind_Resume` i
+podobnych nawet w programach, które same w sobie nie używają wyjątków ani
+C++) - `findLibgcc`/`findLibgccEh` lokalizują je pytając zainstalowane
+`gcc` o ścieżkę (to nie jest "użycie gcc jako kompilatora", tylko
+znalezienie gotowej biblioteki statycznej, podobnie jak zwykłe `-lc`);
+musl nie ma tego problemu i nie potrzebuje tego kroku.
+
+**Świadome ograniczenia tej iteracji** (zgłaszane jako czytelny błąd
+kompilacji - nigdy ciche zepsucie kodu): struct/union nie mogą być
+przekazywane/zwracane przez wartość w wywołaniach funkcji; `-shared`
+nieobsługiwane (wymaga PIC); tylko target x86_64-linux generuje kod w
+tej iteracji. Pełna lista w nagłówku komentarza `codegen.nim` i w
+ROADMAP.md (etap 3).
+
+**Float/double**: pełne wsparcie SysV ABI, dodane po pierwszej wersji
+tego modułu. Model: WSZYSTKO liczone wewnętrznie jako `double` w
+`%xmm0`/`%xmm1` (druga robocza wartość); `float` zawężane do/z double
+TYLKO na granicy pamięci (load/store) przez `cvtss2sd`/`cvtsd2ss` -
+upraszcza rdzeń arytmetyki do jednego zestawu instrukcji SSE2 kosztem
+odrobiny precyzji/wydajności dla czystych obliczeń na `float`. Rejestry
+całkowite (rdi..r9) i zmiennoprzecinkowe (xmm0-7) mają NIEZALEŻNE liczniki
+przy przekazywaniu argumentów/parametrów wg SysV ABI - `classifyArgTypes`
+implementuje tę klasyfikację RAZ i jest współdzielona między `genFunction`
+(odczyt parametrów) i `genArgsCommon` (przekazywanie argumentów), bo obie
+strony MUSZĄ się zgodzić (klasyfikacja zależy wyłącznie od typów w
+sygnaturze). `genArgsCommon` obsługuje poprawnie nawet przepełnienie
+JEDNEJ klasy rejestrów przy wciąż wolnych miejscach w drugiej (np. 7
+argumentów int + 1 double - siódmy int ląduje na stosie, ale double wciąż
+mieści się w xmm0) - wymaga to dwuetapowego schematu (odczyt-przez-offset
+zamiast sekwencyjnego `pop`, potem kompakcja argumentów stosowych do
+ciasnego regionu), bo zwykłe sekwencyjne zdejmowanie ze stosu nie radzi
+sobie z przeplotem klas - szczegółowy komentarz przy `genArgsCommon`
+tłumaczy dlaczego. `ensureRaxBool` normalizuje warunki (`if`/`while`/
+`for`/`?:`/`&&`/`||`) do testu na `%rax` niezależnie od tego, czy
+ostatnia obliczona wartość była w `%rax` czy `%xmm0`.
+
+**Pułapka znaleziona przy pierwszym teście struktur z polami `double`**:
+kod, który iterował `ty.fields` BEZPOŚREDNIO (pomijając `fieldOffset`/
+`fieldType`, które poprawnie podążają za `.resolved` - patrz wyżej),
+widział pustą listę pól dla każdego "kikuta" struct - inicjalizatory pól
+po prostu się nie generowały, bez żadnego błędu kompilacji. `layout.nim`
+eksportuje teraz `resolvedFields()` właśnie po to, żeby taki kod (
+`genLocalInit`, `emitStaticInit`) miał jeden oczywisty, poprawny sposób
+iterowania pól. Wniosek na przyszłość: KAŻDY nowy kod w `codegen.nim`,
+który chce iterować `.fields`/`.enumerators` typu z AST, powinien pytać
+"czy to może być kikut?" i użyć `resolvedFields()`, nie `.fields`
+wprost - `fieldOffset`/`fieldType`/`typeSizeOf` już to robią poprawnie,
+ale to nie jest wymuszone przez system typów Nim, więc łatwo o regresję.
+
+## 21. Cache i tożsamość kompilatora (`src/cache.nim`)
+
+Klucz cache (`computeKey`) musi zależeć nie tylko od treści źródła i
+flag, ale też od TOŻSAMOŚCI SAMEGO KOMPILATORA - inaczej przebudowanie
+zcc (co dzieje się bez przerwy w trakcie jego własnego rozwoju) nie
+unieważnia starych wpisów, i `-c`/link zaczynają cicho zwracać obiekty
+skompilowane poprzednią, potencjalnie wadliwą wersją zcc. Realny bug
+znaleziony w tej sesji: poprawka błędu w codegenie (patrz §20) wyglądała
+na nieskuteczną, dopóki `--verbose` nie ujawnił `cache HIT` na teście,
+który powinien był wymusić rekompilację. `compilerFingerprint()` dolicza
+teraz mtime+rozmiar bieżącego pliku wykonywalnego zcc (`getAppFilename()`)
+do klucza - prosta, ale wystarczająca heurystyka (ten sam mechanizm,
+którego domyślnie używa `ccache` do wykrywania zmiany kompilatora).
