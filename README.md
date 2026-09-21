@@ -40,8 +40,12 @@ src/
   main.nim         # CLI, dispatch (driver)
   options.nim       # parsowanie flag, config kompilacji
   lexer/            # tokenizer C
-  parser/           # AST C (docelowo)
-  codegen/          # backend (docelowo: LLVM albo bezpośrednio ASM/obj)
+  preprocessor/     # #include/#define/#if.../#pragma once
+  parser/           # AST C + recursive-descent parser + pretty-printer
+  sema/             # scoping, diagnostyka semantyczna (-fsyntax-only)
+  codegen/          # backend x86-64 (asembler AT&T) -> as -> ld
+  linker.nim        # wywołanie as/ld, lokalizacja crt/libc, diagnostyka linkera
+  target.nim        # architektura/ABI docelowa, lokalizacja toolchaina hosta
 docs/
   ARCHITECTURE.md
   ROADMAP.md
@@ -62,13 +66,36 @@ Plan etapów: [docs/ROADMAP.md](docs/ROADMAP.md)
 
 ## Status
 
-🚧 **Preprocesor działa** (`#define`, `#include`, `#if`/`#ifdef`, `##`/`#`) —
-`-E` i `--dump-tokens` już coś realnie robią. Parser/sema/codegen wciąż
-w budowie (etap 2+ z roadmapy).
+✅ **Działa - "hello world" kompiluje się i uruchamia naprawdę.**
+Preprocesor, parser, sema i codegen (x86-64 Linux, przez `as`/`ld`) są
+wpięte w pełen pipeline. `./zcc program.c -o program && ./program`
+produkuje prawdziwy plik ELF, statycznie linkowany domyślnie, z
+działającym `printf` i resztą libc. Zweryfikowane end-to-end (w tym
+rekurencja, struktury, wskaźniki, enum+switch, wskaźniki do funkcji,
+**float/double przez SysV XMM** — arytmetyka, porównania, przeplatane
+wywołania wariadyczne typu `printf("%d %f", i, d)`) w `tests/run_tests.nim`.
+
+Uczciwie: to wciąż "MVP" bez optymalizacji (prosty model stack-machine,
+nie alokator rejestrów) i ze świadomymi lukami - **struct/union nie mogą
+być przekazywane ani zwracane przez wartość** w wywołaniach funkcji,
+`-shared` nieobsługiwane, tylko target x86_64-linux generuje kod. Każda
+z tych luk zgłasza czytelny błąd kompilacji, nigdy nie psuje kodu po
+cichu. Pełna, aktualna lista: nagłówek komentarza w
+`src/codegen/codegen.nim` i `docs/ROADMAP.md` (etap 3).
+
+```sh
+./zcc program.c -o program && ./program   # pełna kompilacja + link + uruchomienie
+./zcc -c plik.c -o plik.o                 # tylko obiekt (bez linkowania)
+./zcc -S plik.c -o plik.s                 # tylko asembler (do inspekcji)
+./zcc -fsyntax-only plik.c                # sparsuj + sprawdź semantycznie, bez codegenu
+./zcc --dump-ast plik.c                   # jak wyżej + wypisz drzewo AST
+./zcc -E plik.c                           # tylko preprocesor
+nimble test                                # pełny zestaw testów (w tym end-to-end codegenu)
+```
 
 Dodatkowo zaimplementowane jako flagi/moduły niezależne od parsera:
 hardening (`--hardened=`), sanitizery (`-fsanitize=`), cross-compilation
 (`--target=`), LTO (`--lto=`), reproducible builds (`--reproducible`),
-`-MM`/`-MMD`, cache builda, config projektu (`zcc.toml`), plugin API
-(`--plugin=`). Szczegóły i uczciwa lista ograniczeń każdego:
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+`-MM`/`-MMD`, cache builda (realnie spięty z `-c`/link), config projektu
+(`zcc.toml`), plugin API (`--plugin=`). Szczegóły i uczciwa lista
+ograniczeń każdego: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
