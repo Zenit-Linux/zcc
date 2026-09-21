@@ -16,10 +16,10 @@ proc newLexer*(src, file: string, std: CStd): Lexer =
   Lexer(src: src, pos: 0, line: 1, col: 1, file: file, std: std, diags: @[])
 
 proc atEnd(l: Lexer): bool = l.pos >= l.src.len
-proc cur(l: Lexer): char = if l.atEnd: '\0' else: l.src[l.pos]
+proc cur(l: Lexer): char = (if l.atEnd: '\0' else: l.src[l.pos])
 proc peek(l: Lexer, off = 1): char =
   let p = l.pos + off
-  if p >= l.src.len: '\0' else: l.src[p]
+  (if p >= l.src.len: '\0' else: l.src[p])
 
 proc advance(l: var Lexer) =
   if not l.atEnd:
@@ -67,14 +67,42 @@ proc lexNumber(l: var Lexer): Token =
   let startCol = l.col
   var s = ""
   var isFloat = false
-  # bardzo uproszczone na tym etapie: brak jeszcze hex-float, binarnych
-  # literałów (0b...), separatorów cyfr z C23 (') - TODO w kolejnej iteracji
-  while not l.atEnd and (l.cur.isDigit or l.cur == '.'):
-    if l.cur == '.': isFloat = true
-    s.add l.cur
-    l.advance()
+  # literały szesnastkowe/binarne (0x.../0b...) - muszą być rozpoznane
+  # PRZED pętlą dziesiętną, bo inaczej '0' kończy skanowanie i 'x'/'b'
+  # trafia jako osobny identyfikator (tak to wcześniej wyglądało - realny
+  # bug: `0x0F` lexował się jako token '0' + identyfikator 'x0F').
+  if l.cur == '0' and (l.peek() == 'x' or l.peek() == 'X'):
+    s.add l.cur; l.advance()
+    s.add l.cur; l.advance()
+    while not l.atEnd and (l.cur.isDigit or l.cur in {'a'..'f', 'A'..'F'}):
+      s.add l.cur; l.advance()
+  elif l.cur == '0' and (l.peek() == 'b' or l.peek() == 'B'):
+    s.add l.cur; l.advance()
+    s.add l.cur; l.advance()
+    while not l.atEnd and l.cur in {'0', '1'}:
+      s.add l.cur; l.advance()
+  else:
+    # dziesiętne/ósemkowe/zmiennoprzecinkowe - w tym uproszczona notacja
+    # wykładnicza (1e10, 1.5e-3); brak jeszcze hex-floatów - TODO
+    while not l.atEnd and (l.cur.isDigit or l.cur == '.'):
+      if l.cur == '.': isFloat = true
+      s.add l.cur
+      l.advance()
+    if not l.atEnd and (l.cur == 'e' or l.cur == 'E'):
+      let savedPos = l.pos
+      var exp = ""
+      exp.add l.cur; l.advance()
+      if not l.atEnd and (l.cur == '+' or l.cur == '-'):
+        exp.add l.cur; l.advance()
+      if not l.atEnd and l.cur.isDigit:
+        while not l.atEnd and l.cur.isDigit:
+          exp.add l.cur; l.advance()
+        s.add exp
+        isFloat = true
+      else:
+        l.pos = savedPos  # 'e'/'E' nie było jednak wykładnikiem - cofnij się
   # sufiksy: u/U, l/L, f/F itd.
-  while not l.atEnd and l.cur in {'u','U','l','L','f','F'}:
+  while not l.atEnd and l.cur in {'u', 'U', 'l', 'L', 'f', 'F'}:
     s.add l.cur
     l.advance()
   result = l.mkTok(if isFloat: tkFloatLit else: tkIntLit, s, startLine, startCol)
