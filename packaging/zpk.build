@@ -1,1 +1,19 @@
+package {
+  name        = "zcc"
+  version     = "0.0.1"
+  arch        = ["x86_64"]
+  description = "Zenit C Compiler - kompilator C99-C23 napisany w Nim (backend C dla Nim i Zenit Linux)"
+  depends_on  = ["binutils"]
+}
 
+recipe {
+  file = "recipe.janet"
+  lang = "janet"
+}
+
+release {
+  repo       = "https://github.com/Zenit-Linux/own-repository"
+  repo_file  = "repo/own-repository.json"
+  asset_name = "zcc"
+  # release_repo_url = "..."   # domyslnie wykrywane z `git remote origin`
+}
