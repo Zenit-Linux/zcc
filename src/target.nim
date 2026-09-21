@@ -1,4 +1,4 @@
-import std/strutils
+import std/[strutils, os, osproc]
 
 type
   Arch* = enum arX86_64, arAArch64, arRiscv64, arUnknown
@@ -62,8 +62,89 @@ proc llvmTriple*(t: Target): string =
     of tabiUnknown: "unknown"
   a & "-" & o & "-" & ab
 
+## Szuka libgcc.a - biblioteki wsparcia runtime (m.in. `_Unwind_Resume`,
+## konwersje `__unordtf2`/`__letf2` dla `long double`) potrzebnej przy
+## STATYCZNYM linkowaniu z glibc - glibc.a odwołuje się do tych symboli
+## nawet w programach, które same w sobie ich nie używają (m.in. przez
+## kod obsługi wyjątków/informacji o `long double` w printf). Dostarcza
+## ją zwykle gcc; pytamy go o ścieżkę zamiast linkować przez niego -
+## to nie jest "użycie gcc jako kompilatora", tylko zlokalizowanie
+## gotowej biblioteki statycznej, podobnie jak zwykłe `-lc`. musl nie ma
+## tego problemu (nie potrzeba libgcc do podstawowego statycznego
+## linkowania), więc to dotyczy tylko ABI gnu.
+proc findLibgcc*(): string =
+  let gccExe = findExe("gcc")
+  if gccExe.len == 0: return ""
+  try:
+    let (output, code) = execCmdEx(gccExe & " -print-libgcc-file-name")
+    if code == 0:
+      let p = output.strip()
+      if p.len > 0 and fileExists(p): return p
+  except OSError:
+    discard
+  result = ""
+
+## `libgcc.a` samo w sobie zostawia `_Unwind_Resume` (rozwijanie stosu
+## przy wyjątkach) niezdefiniowanym - potrzebna jeszcze `libgcc_eh.a`
+## (tak samo robi to `gcc -static` pod spodem, dodając obie).
+proc findLibgccEh*(): string =
+  let gccExe = findExe("gcc")
+  if gccExe.len == 0: return ""
+  try:
+    let (output, code) = execCmdEx(gccExe & " -print-file-name=libgcc_eh.a")
+    if code == 0:
+      let p = output.strip()
+      if p.len > 0 and p != "libgcc_eh.a" and fileExists(p): return p
+  except OSError:
+    discard
+  result = ""
+
 proc resolveTarget*(triple: string): Target =
   if triple.len == 0 or triple == "host":
     hostTarget()
   else:
     parseTarget(triple)
+
+# ============================== lokalizacja libc/crt na hoście ==============================
+
+type LibcPaths* = object
+  found*: bool
+  crt1*, crti*, crtn*: string
+  libDir*: string
+  dynLinker*: string
+  abi*: TargetAbi
+
+## Szuka na hoście obiektów startowych (crt1.o/crti.o/crtn.o) i katalogu
+## libc pasujących do żądanej ABI, z fallbackiem na drugą ABI, jeśli
+## preferowanej brak. Zenit Linux (docelowa dystrybucja projektu) ma być
+## na musl, ale większość maszyn deweloperskich (w tym to środowisko) ma
+## tylko glibc - brak musla nie powinien blokować budowy tutaj, stąd ta
+## próba obu zamiast twardego wymagania jednej. Pełna cross-kompilacja
+## (inny sysroot/architektura niż hosta) jest świadomym TODO tej iteracji
+## codegenu - patrz ARCHITECTURE.md/ROADMAP.md.
+proc findCLibPaths*(preferred: TargetAbi): LibcPaths =
+  type Candidate = tuple[abi: TargetAbi, dir: string, dynLinker: string]
+  let candidates: seq[Candidate] =
+    @[
+      (tabiMusl, "/usr/lib/x86_64-linux-musl", "/lib/ld-musl-x86_64.so.1"),
+      (tabiGnu, "/usr/lib/x86_64-linux-gnu", "/lib64/ld-linux-x86-64.so.2"),
+      (tabiGnu, "/usr/lib64", "/lib64/ld-linux-x86-64.so.2"),
+    ]
+  proc tryDir(dir, dynLinker: string, abi: TargetAbi): LibcPaths =
+    let c1 = dir / "crt1.o"
+    let c2 = dir / "crti.o"
+    let c3 = dir / "crtn.o"
+    if fileExists(c1) and fileExists(c2) and fileExists(c3):
+      return LibcPaths(found: true, crt1: c1, crti: c2, crtn: c3,
+                        libDir: dir, dynLinker: dynLinker, abi: abi)
+    LibcPaths(found: false)
+
+  for c in candidates:
+    if c.abi == preferred:
+      let r = tryDir(c.dir, c.dynLinker, c.abi)
+      if r.found: return r
+  for c in candidates:
+    if c.abi != preferred:
+      let r = tryDir(c.dir, c.dynLinker, c.abi)
+      if r.found: return r
+  LibcPaths(found: false)
