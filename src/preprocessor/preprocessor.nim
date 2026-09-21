@@ -1,4 +1,4 @@
-import std/[os, strutils, tables, sets]
+import std/[os, strutils, sets]
 import pp_lexer
 import macros
 import pp_expr
