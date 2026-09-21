@@ -1,6 +1,3 @@
-import std/strutils
-import options as zccopts
-
 type LtoMode* = enum
   ltoOff
   ltoThin   ## zalecany default przy -O2/-O3: dużo korzyści, mniejszy koszt cache/RAM
