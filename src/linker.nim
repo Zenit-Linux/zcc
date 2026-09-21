@@ -1,4 +1,5 @@
-import std/[strutils, tables]
+import std/[strutils, tables, osproc, sequtils]
+import target
 
 type LinkerSuggestion* = object
   missingSymbol*: string
@@ -79,3 +80,58 @@ proc formatSuggestions*(suggestions: seq[LinkerSuggestion]): string =
     lines.add "  brakujący symbol '" & s.missingSymbol & "' -> spróbuj dodać " &
       s.suggestedFlag & "  (" & s.reason & ")"
   lines.join("\n")
+
+# ============================== rzeczywiste wywołania as/ld ==============================
+#
+# Świadomie `as`/`ld` z binutils, NIE `gcc`/`clang` jako "linker driver" -
+# zcc ma być samodzielnym kompilatorem, nie nakładką na cudzy driver.
+# Koszt tej decyzji: musimy sami znaleźć obiekty startowe (crt1.o itd.)
+# i katalog libc - patrz `target.findCLibPaths`.
+
+## Składa jeden plik .s (wygenerowany przez codegen.nim) do obiektu .o.
+proc assembleFile*(asmPath, objPath: string): tuple[ok: bool, output: string] =
+  let (output, code) = execCmdEx("as --64 -o " & quoteShell(objPath) & " " & quoteShell(asmPath))
+  (code == 0, output)
+
+## Linkuje gotowe pliki .o w wykonywalny plik ELF, dowiązując crt*.o i
+## libc dla danej architektury/ABI (statycznie domyślnie - patrz README
+## "statyczne linkowanie domyślnie"). Zwraca (false, <surowy wyjście ld>)
+## przy błędzie - wołający może przepuścić to przez
+## `analyzeLinkerFailure`/`formatSuggestions` z tego samego modułu, żeby
+## dodać sugestie brakujących bibliotek.
+proc linkExecutable*(objFiles: seq[string], output: string, tgt: Target,
+                      staticLink: bool, extraLibs: seq[string] = @[],
+                      extraLibDirs: seq[string] = @[]): tuple[ok: bool, output: string] =
+  let libc = findCLibPaths(tgt.abi)
+  if not libc.found:
+    return (false, "zcc: nie znaleziono crt1.o/crti.o/crtn.o ani biblioteki libc " &
+      "dla ABI '" & $tgt.abi & "' (ani dla alternatywnej dostępnej na hoście) - " &
+      "zainstaluj pakiet nagłówków/bibliotek developerskich libc (np. libc6-dev " &
+      "dla glibc albo musl-tools dla musl)")
+  var args: seq[string] = @["-o", output]
+  if staticLink:
+    args.add "-static"
+  else:
+    args.add "-dynamic-linker"
+    args.add libc.dynLinker
+  args.add libc.crt1
+  args.add libc.crti
+  for f in objFiles: args.add f
+  args.add "-L" & libc.libDir
+  for d in extraLibDirs: args.add "-L" & d
+  args.add "--start-group"
+  args.add "-lc"
+  for l in extraLibs: args.add "-l" & l
+  if staticLink and libc.abi == tabiGnu:
+    # glibc.a odwołuje się do symboli wsparcia z libgcc.a/libgcc_eh.a
+    # nawet w programach, które same ich nie używają - patrz komentarz
+    # przy `findLibgcc`/`findLibgccEh` w target.nim.
+    let libgcc = findLibgcc()
+    let libgccEh = findLibgccEh()
+    if libgcc.len > 0: args.add libgcc
+    if libgccEh.len > 0: args.add libgccEh
+  args.add "--end-group"
+  args.add libc.crtn
+  let cmd = "ld " & args.mapIt(quoteShell(it)).join(" ")
+  let (output, code) = execCmdEx(cmd)
+  (code == 0, output)
