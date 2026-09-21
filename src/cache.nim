@@ -1,4 +1,4 @@
-import std/[os, hashes, strutils]
+import std/[os, hashes, strutils, times]
 import options as zccopts
 
 type
@@ -11,9 +11,31 @@ proc cacheDirFor*(cfg: zccopts.Config): string =
   if cfg.cacheDir.len > 0: cfg.cacheDir
   else: getHomeDir() / ".cache" / "zcc"
 
+## Odcisk BIEŻĄCO URUCHOMIONEGO binarium zcc (mtime + rozmiar pliku
+## wykonywalnego) - musi wejść do klucza cache, inaczej przebudowanie
+## samego kompilatora (np. w trakcie jego rozwoju - dokładnie tak, jak
+## znaleziono ten bug: naprawiono realny błąd w codegenie, a `-c`/link
+## dalej cicho zwracały OBIEKTY SKOMPILOWANE STARĄ, WADLIWĄ WERSJĄ zcc,
+## bo klucz zależał tylko od źródła i flag, nigdy od tożsamości samego
+## kompilatora) daje fałszywe trafienia cache ze STARYM, potencjalnie
+## niepoprawnym kodem wynikowym. Liczone raz i cache'owane w module-level
+## `var`, żeby nie stać'ować/odczytywać własnego pliku wykonywalnego przy
+## każdym wywołaniu `computeKey` w ramach jednego przebiegu kompilatora.
+var compilerFingerprintCache = ""
+proc compilerFingerprint(): string =
+  if compilerFingerprintCache.len == 0:
+    try:
+      let exe = getAppFilename()
+      let info = getFileInfo(exe)
+      compilerFingerprintCache = $info.lastWriteTime.toUnix() & ":" & $info.size
+    except OSError:
+      compilerFingerprintCache = "unknown"
+  compilerFingerprintCache
+
 proc computeKey*(sourcePath: string, cfg: zccopts.Config): string =
   let content = readFile(sourcePath)
   var h = hash(content)
+  h = h !& hash(compilerFingerprint())
   h = h !& hash($cfg.std)
   h = h !& hash($cfg.opt)
   h = h !& hash(cfg.debugInfo)
