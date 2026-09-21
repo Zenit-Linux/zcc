@@ -1,4 +1,4 @@
-import std/[os, envvars]
+import std/os
 import options as zccopts
 
 type ReproFlags* = object
