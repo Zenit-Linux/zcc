@@ -1,9 +1,10 @@
-import std/[os, osproc, cpuinfo]
+import std/osproc
+import std/cpuinfo as cpuinfomod
 import options as zccopts
 
 proc jobCount*(cfg: zccopts.Config): int =
   if cfg.jobs > 0: cfg.jobs
-  else: max(1, countProcessors())
+  else: max(1, cpuinfomod.countProcessors())
 
 type CompileJob* = object
   input*: string
@@ -19,7 +20,7 @@ type JobResult* = object
 proc runParallel*(jobs: seq[CompileJob], selfExe: string, maxJobs: int): seq[JobResult] =
   result = @[]
   var pending = jobs
-  var running: seq[tuple[proc: Process, input: string]] = @[]
+  var running: seq[tuple[process: Process, input: string]] = @[]
 
   proc reapOne() =
     # Prosta strategia: czekamy na pierwszy proces w kolejce startu.
