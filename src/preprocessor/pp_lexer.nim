@@ -21,10 +21,10 @@ type
 proc newPpLexer*(src: string): PpLexer = PpLexer(src: src, pos: 0, line: 1, col: 1)
 
 proc atEnd(l: PpLexer): bool = l.pos >= l.src.len
-proc cur(l: PpLexer): char = if l.atEnd: '\0' else: l.src[l.pos]
+proc cur(l: PpLexer): char = (if l.atEnd: '\0' else: l.src[l.pos])
 proc peek(l: PpLexer, off = 1): char =
   let p = l.pos + off
-  if p >= l.src.len: '\0' else: l.src[p]
+  (if p >= l.src.len: '\0' else: l.src[p])
 
 proc advance(l: var PpLexer) =
   if not l.atEnd:
@@ -93,8 +93,8 @@ proc tokenizeAll*(src: string): seq[PpToken] =
     let startCol = l.col
     let c = l.cur
 
-    template emit(k: PpTokenKind, text: string) =
-      result.add PpToken(kind: k, text: text, line: startLine, col: startCol,
+    template emit(k: PpTokenKind, txt: string) =
+      result.add PpToken(kind: k, text: txt, line: startLine, col: startCol,
                           atLineStart: atLineStart, spaceBefore: sawSpace)
       atLineStart = false
       sawSpace = false
